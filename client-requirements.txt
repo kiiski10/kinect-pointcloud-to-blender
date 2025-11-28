@@ -1,1 +1,4 @@
+# Installing of freenect python library requires libfreenect development files to be installed.
+# On Ubuntu run: `apt install libfreenect-dev`
+
 freenect==0.1.0
