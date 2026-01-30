@@ -20,12 +20,24 @@ import numpy as np
 import threading
 import queue
 import time
+from collections import deque
 # --- Addon Setup ---
 
 # Global variables to manage the server thread and data queue
 server_thread = None
 stop_event = threading.Event()
 frame_queue = queue.Queue()
+
+# Log management
+log_lock = threading.Lock()
+log_messages = deque(maxlen=10)
+
+def add_log(msg):
+    """Thread-safe append a timestamped message to the log deque."""
+    timestamp = time.strftime("%H:%M:%S")
+    entry = f"[{timestamp}] {msg}"
+    with log_lock:
+        log_messages.append(entry.strip())
 
 # FPS globals
 frame_count = 0
@@ -119,7 +131,8 @@ def update_point_cloud():
         # Get a frame from the queue without blocking
         depth_map = frame_queue.get_nowait()
     except queue.Empty:
-        # No new frame, check again later
+        # Sync logs even when no new frame so UI stays up-to-date
+        sync_logs_to_scene()
         return 0.0025
 
     obj = create_or_get_point_cloud_obj()
@@ -182,6 +195,9 @@ def update_point_cloud():
         frame_count = 0
         last_fps_time = now
 
+    # Sync logs so the UIList active index moves to latest
+    sync_logs_to_scene()
+
     # Check again for a new frame very soon
     return 0.0025
 
@@ -215,12 +231,14 @@ def server_run(stop_event, frame_queue):
         s.bind(socket_path)
         s.listen()
         s.settimeout(1.0)
+        add_log(f"Server listening on socket: {socket_path}")
         print(f"Server listening on socket: {socket_path}")
 
         while not stop_event.is_set():
             try:
                 conn, addr = s.accept()
                 with conn:
+                    add_log("Client connected")
                     print("Client connected")
                     while not stop_event.is_set():
                         raw_data_size = recvall(conn, 4)
@@ -246,14 +264,14 @@ def server_run(stop_event, frame_queue):
             except socket.timeout:
                 continue
             except Exception as e:
-                print(f"Server error: {e}")
+                add_log(f"Server error: {e}")
                 break
             finally:
-                print("Client disconnected")
+                add_log("Client disconnected")
 
     if os.path.exists(socket_path):
         os.remove(socket_path)
-    print("Server has stopped.")
+    add_log("Server has stopped.")
 
 
 # --- Blender Operators ---
@@ -273,8 +291,10 @@ class WM_OT_StartKinectServer(bpy.types.Operator):
             # Register the timer to update the UI
             bpy.app.timers.register(update_point_cloud)
 
+            add_log("Kinect server started.")
             self.report({'INFO'}, "Kinect server started.")
         else:
+            add_log("Start attempted but server already running.")
             self.report({'WARNING'}, "Server is already running.")
         return {'FINISHED'}
 
@@ -294,13 +314,53 @@ class WM_OT_StopKinectServer(bpy.types.Operator):
             stop_event.set()
             server_thread.join(timeout=2.0)
             server_thread = None
+            add_log("Kinect server stopped.")
             self.report({'INFO'}, "Kinect server stopped.")
         else:
+            add_log("Stop attempted but server was not running.")
             self.report({'WARNING'}, "Server is not running.")
         return {'FINISHED'}
 
+# New operator to clear logs
+class WM_OT_ClearKinectLogs(bpy.types.Operator):
+    """Clear Kinect log messages"""
+    bl_idname = "wm.clear_kinect_logs"
+    bl_label = "Clear Logs"
 
-# --- UI Panel ---
+    def execute(self, context):
+        with log_lock:
+            log_messages.clear()
+        # clear the UI collection as well (main thread)
+        context.scene.kinect_log_items.clear()
+        context.scene.kinect_log_active_index = 0
+        return {'FINISHED'}
+
+
+# --- UI-backed log support (main-thread) ---
+def sync_logs_to_scene():
+    """Copy thread-safe deque into scene collection and set active index to last item."""
+    try:
+        scn = bpy.context.scene
+    except Exception:
+        return
+    with log_lock:
+        logs = list(log_messages)
+    # ensure the collection exists on the scene (registered in register())
+    scn.kinect_log_items.clear()
+    for msg in logs:
+        it = scn.kinect_log_items.add()
+        it.message = msg
+    scn.kinect_log_active_index = max(0, len(scn.kinect_log_items) - 1)
+
+
+# New lightweight item holder for the UIList
+class KinectLogItem(bpy.types.PropertyGroup):
+    message: bpy.props.StringProperty(name="Message")
+
+class VIEW3D_UL_KinectLogs(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if item:
+            layout.label(text=item.message)
 
 class VIEW3D_PT_KinectServerPanel(bpy.types.Panel):
     bl_label = "Kinect Server"
@@ -319,12 +379,23 @@ class VIEW3D_PT_KinectServerPanel(bpy.types.Panel):
         layout.prop(context.scene, "kinect_scale_factor_z")
         layout.label(text=f"FPS: {current_fps:.1f}")  # Added
 
+        # --- Logs box (UIList will auto-scroll to active index) ---
+        box = layout.box()
+        row = box.row(align=True)
+        row.label(text="Logs:")
+        row.operator(WM_OT_ClearKinectLogs.bl_idname, text="", icon='TRASH')
+        box.template_list("VIEW3D_UL_KinectLogs", "kinect_logs", context.scene,
+                          "kinect_log_items", context.scene, "kinect_log_active_index", rows=5)
+
 
 # --- Registration ---
 
 classes = (
     WM_OT_StartKinectServer,
     WM_OT_StopKinectServer,
+    WM_OT_ClearKinectLogs,
+    KinectLogItem,
+    VIEW3D_UL_KinectLogs,
     VIEW3D_PT_KinectServerPanel,
 )
 
@@ -360,6 +431,10 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    # Scene collection + active index for the UIList
+    bpy.types.Scene.kinect_log_items = bpy.props.CollectionProperty(type=KinectLogItem)
+    bpy.types.Scene.kinect_log_active_index = bpy.props.IntProperty(default=0)
+
 def unregister():
     # Ensure the server and timer are stopped when the addon is disabled
     if server_thread and server_thread.is_alive():
@@ -367,6 +442,12 @@ def unregister():
         server_thread.join(timeout=2.0)
     if bpy.app.timers.is_registered(update_point_cloud):
         bpy.app.timers.unregister(update_point_cloud)
+
+    # remove Scene properties
+    if hasattr(bpy.types.Scene, "kinect_log_items"):
+        del bpy.types.Scene.kinect_log_items
+    if hasattr(bpy.types.Scene, "kinect_log_active_index"):
+        del bpy.types.Scene.kinect_log_active_index
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
